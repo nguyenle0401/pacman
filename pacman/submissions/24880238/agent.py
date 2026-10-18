@@ -37,6 +37,8 @@ class GhostAgent(BaseGhostAgent):
         self.last_known_enemy_pos = None
         self.visits = Counter()
         self.topology = None
+        self.possible_enemies = set()
+        self.previous_step = None
 
     @staticmethod
     def _manhattan(a, b):
@@ -67,6 +69,51 @@ class GhostAgent(BaseGhostAgent):
                     current = nxt
             self.actions[pos] = actions
             self.targets[pos] = tuple(sorted(targets))
+        self.pacman_distances = {}
+        degree = {pos: len(self.actions[pos]) - 1 for pos in cells}
+        queue = deque(pos for pos in cells if degree[pos] <= 1)
+        while queue:
+            pos = queue.popleft()
+            for _, nxt in self.actions[pos]:
+                if nxt != pos and degree[nxt] > 1:
+                    degree[nxt] -= 1
+                    if degree[nxt] == 1:
+                        queue.append(nxt)
+        self.trapped = {pos for pos in cells if degree[pos] <= 1}
+        self.possible_enemies.clear()
+
+    def _pacman_distance_map(self, start):
+        if start not in self.pacman_distances:
+            distances, queue = {start: 0}, deque([start])
+            while queue:
+                pos = queue.popleft()
+                for nxt in self.targets[pos]:
+                    if nxt not in distances:
+                        distances[nxt] = distances[pos] + 1
+                        queue.append(nxt)
+            self.pacman_distances[start] = distances
+        return self.pacman_distances[start]
+
+    def _update_belief(self, grid, enemy, step_number):
+        if enemy is not None:
+            self.possible_enemies = {enemy}
+        else:
+            elapsed = (step_number - self.previous_step
+                       if self.previous_step is not None else 0)
+            if not self.possible_enemies or elapsed < 0:
+                self.possible_enemies = set(self.actions)
+            for _ in range(min(max(0, elapsed), len(self.actions))):
+                expanded = {nxt for pos in self.possible_enemies
+                            for nxt in self.targets[pos]}
+                if expanded == self.possible_enemies:
+                    break
+                self.possible_enemies = expanded
+            self.possible_enemies = {pos for pos in self.possible_enemies
+                                     if grid[pos] == -1}
+            if not self.possible_enemies:
+                self.possible_enemies = {pos for pos in self.actions
+                                         if grid[pos] == -1}
+        self.previous_step = step_number
 
     def _distance_map(self, start):
         if start not in self.distances:
@@ -83,8 +130,10 @@ class GhostAgent(BaseGhostAgent):
     def _evaluate(self, ghost, pacman):
         distance = self._distance_map(pacman).get(ghost, 1000)
         exits = len(self.actions[ghost]) - 1
-        return (12 * min(distance, 40) + 4 * exits
+        turns = self._pacman_distance_map(pacman).get(ghost, 1000)
+        return (12 * min(distance, 40) + 10 * min(turns, 20) + 4 * exits
                 - (24 if exits <= 1 else 0)
+                - (32 if ghost in self.trapped else 0)
                 + 0.5 * min(self._manhattan(ghost, pacman), 20))
 
     def _check_time(self):
@@ -155,6 +204,7 @@ class GhostAgent(BaseGhostAgent):
         """
         # TODO: Implement your search algorithm here
         self._prepare_map(map_state)
+        self._update_belief(map_state, enemy_position, step_number)
         self.visits[my_position] += 1
         # Update memory if enemy is visible
         if enemy_position is not None:
@@ -162,6 +212,19 @@ class GhostAgent(BaseGhostAgent):
         # Use current sighting, fallback to last known, or explore.
         threat = self.last_known_enemy_pos
         actions = self.actions[my_position]
+        if enemy_position is None and self.possible_enemies:
+            def hidden_score(action):
+                move, pos = action
+                danger = sum(
+                    any(self._manhattan(pos, target) < self.capture_distance
+                        for target in self.targets[enemy])
+                    for enemy in self.possible_enemies)
+                distance = min(self._distance_map(enemy).get(pos, 1000)
+                               for enemy in self.possible_enemies)
+                return (-danger, distance, pos not in self.trapped,
+                        len(self.actions[pos]), -self.visits[pos],
+                        move != Move.STAY)
+            return max(actions, key=hidden_score)[0]
         if threat is None:
             # No information about enemy - explore less visited positions.
             return max(actions, key=lambda a: (
