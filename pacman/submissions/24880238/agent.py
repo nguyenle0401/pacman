@@ -1,7 +1,7 @@
-﻿"""Ghost: simultaneous maximin with alpha-beta and cached search bounds."""
+﻿"""Ghost: exact survival tables, online pursuit models and bounded fog search."""
 import sys
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from pathlib import Path
 import numpy as np
 
@@ -11,7 +11,11 @@ from agent_interface import GhostAgent as BaseGhostAgent
 from environment import Move
 
 
-MAX_TABLE_CELLS = 512
+MAX_TABLE_BYTES = 64 * 1024 * 1024
+MAX_BELIEF_CELLS = 2048
+MODEL_CACHE_SIZE = 64
+DISTANCE_CACHE_SIZE = 128
+MAX_ESCAPE_REGION = 64
 UNREACHABLE_DISTANCE = 1000
 TERMINAL_SCORE = 100000
 STRATEGY_TIME_FRACTION = 0.65
@@ -19,6 +23,12 @@ MODEL_BFS = 0
 MODEL_GREEDY_VERTICAL = 1
 MODEL_GREEDY_HORIZONTAL = 2
 MODEL_RANDOM = 3
+MODEL_BFS_RANDOM = 4
+MODEL_BFS_REVERSE = 5
+MODEL_BFS_SLOW = 6
+MODEL_INTERCEPT = 7
+RESPONSE_MODELS = (MODEL_BFS, MODEL_BFS_REVERSE, MODEL_BFS_SLOW, MODEL_INTERCEPT,
+                   MODEL_GREEDY_VERTICAL, MODEL_GREEDY_HORIZONTAL)
 MIN_MODEL_OBSERVATIONS = 2
 MODEL_CONFIDENCE_THRESHOLD = 0.55
 FORECAST_HORIZON = 4
@@ -30,24 +40,24 @@ class SearchTimeout(Exception):
 
 
 class GhostAgent(BaseGhostAgent):
-    """
-    Ghost (Hider) Agent - Goal: Avoid being caught
+    """Evade simultaneous moves using robust and learned survival tables.
 
-    Implement your search algorithm to evade Pacman as long as possible.
-    Suggested algorithms: BFS (find furthest point), Minimax, Monte Carlo
-
-    Current implementation: BFS evaluation and minimax with alpha-beta.
+    Fog decisions use a filtered position belief and a bounded beam search.
+    Large maps fall back to iterative deepening when pair tables do not fit.
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # TODO: Initialize any data structures you need
         # Ghost receives no settings from the loader. These match CLI defaults.
         self.pacman_speed = max(1, int(kwargs.get('pacman_speed', 2)))
         self.capture_distance = max(1, int(kwargs.get('capture_distance', 2)))
         self.max_steps = int(kwargs.get('max_steps', 200))
-        self.time_budget = float(kwargs.get('time_budget', 0.15))
-        self.max_depth = int(kwargs.get('max_depth', 8))
+        self.time_budget = max(0.0, float(kwargs.get('time_budget', 0.15)))
+        self.max_depth = max(1, int(kwargs.get('max_depth', 8)))
+        self.forecast_horizon = max(1, int(kwargs.get('forecast_horizon', FORECAST_HORIZON)))
+        self.forecast_beam_width = max(5, int(kwargs.get('forecast_beam_width', FORECAST_BEAM_WIDTH)))
+        self.policy_tiebreak = bool(kwargs.get('policy_tiebreak', True))
+        self.learned_tables = bool(kwargs.get('learned_tables', True))
         # Memory for limited observation mode
         self.last_known_enemy_pos = None
         self.visits = Counter()
@@ -56,10 +66,17 @@ class GhostAgent(BaseGhostAgent):
         self.deadline = float('inf')
         self.maximin_strategy = None
         self.current_position = None
-        self.model_prior = np.asarray([0.4, 0.25, 0.25, 0.1])
+        self.model_prior = np.asarray([0.28, 0.22, 0.22, 0.07, 0.07, 0.05, 0.03, 0.06])
+        # Before any observed transition, spread BFS ties rather than predicting
+        # one arbitrary tie-break throughout an unseen opponent's trajectory.
+        self.fog_prior = np.zeros(len(self.model_prior))
+        self.fog_prior[[MODEL_BFS_RANDOM, MODEL_GREEDY_VERTICAL,
+                        MODEL_GREEDY_HORIZONTAL, MODEL_RANDOM]] = (0.4, 0.25, 0.25, 0.1)
         self.fog_enabled = False
         self.decision_mode = 'fallback'
-        self.bfs_response_strategy = None
+        self.policy_strategy = None
+        self.policy_strategies = OrderedDict()
+        self.policy_builders = {}
         self.ordered_target_cache = {}
         self._reset_episode_state()
 
@@ -73,10 +90,10 @@ class GhostAgent(BaseGhostAgent):
         self.last_sighting = None
         self.model_weights = self.model_prior.copy()
         self.model_observations = 0
+        self.model_streaks = np.zeros(len(self.model_prior), dtype=np.int32)
         self.vision_radius = 0
         self.visibility_cache = {}
-        self.bfs_consistent = True
-        self.bfs_observations = 0
+        self.response_model = MODEL_BFS
 
     @staticmethod
     def _manhattan(a, b):
@@ -130,15 +147,32 @@ class GhostAgent(BaseGhostAgent):
                     if degree[nxt] == 1:
                         queue.append(nxt)
         trapped = {pos for pos in cells if degree[pos] <= 1}
-        escape_routes = self._find_escape_routes(all_actions)
+        full_deadline = self.deadline
+        now = time.perf_counter()
+        self.deadline = min(full_deadline, now + max(0, full_deadline - now) * 0.4)
+        try:
+            escape_routes = self._find_escape_routes(all_actions)
+        except SearchTimeout:
+            # Optional pocket analysis must not prevent the cheap topology from
+            # ever being published on a large map. Dead-end detection is retained.
+            escape_routes = {pos: () for pos in cells}
+        finally:
+            self.deadline = full_deadline
         self.topology = topology
         self.ghost_actions, self.pacman_targets = all_actions, all_targets
+        self.ghost_neighbors = {pos: tuple(nxt for move, nxt in moves if move != Move.STAY)
+                                for pos, moves in all_actions.items()}
         self.capture_zones, self.trapped = capture_zones, trapped
         self.escape_routes = escape_routes
-        self.maze_distance_cache, self.pacman_turn_cache = {}, {}
+        self.maze_distance_cache, self.pacman_turn_cache = OrderedDict(), OrderedDict()
+        self.expansion_cache = OrderedDict()
+        self.multi_distance_cache = OrderedDict()
+        self.evaluation_cache = OrderedDict()
         self.maximin_strategy = None
         self.fog_enabled = False
-        self.bfs_response_strategy = None
+        self.policy_strategy = None
+        self.policy_strategies = OrderedDict()
+        self.policy_builders = {}
         self.ordered_target_cache = {}
         self._reset_episode_state()
 
@@ -179,27 +213,39 @@ class GhostAgent(BaseGhostAgent):
                 elif nxt != parent[pos]:
                     low[pos] = min(low[pos], discovered[nxt])
 
+        # Only small pockets materially contribute to the escape penalty. Avoid
+        # traversing the entire map once per articulation point on large mazes.
+        component_sizes = {}
+        for root in neighbors:
+            if root in component_sizes:
+                continue
+            component, queue = {root}, deque([root])
+            while queue:
+                pos = queue.popleft()
+                for nxt in neighbors[pos]:
+                    if nxt not in component:
+                        component.add(nxt)
+                        queue.append(nxt)
+            component_sizes.update(dict.fromkeys(component, len(component)))
         routes = {pos: [] for pos in neighbors}
         for gate in sorted(gates):
+            limit = min(MAX_ESCAPE_REGION, (component_sizes[gate] - 1) // 2)
             seen, regions = {gate}, []
             for start in neighbors[gate]:
                 if start in seen:
                     continue
                 region, queue = {start}, deque([start])
-                seen.add(start)
-                while queue:
+                while queue and len(region) <= limit:
                     self._check_time()
                     pos = queue.popleft()
                     for nxt in neighbors[pos]:
-                        if nxt not in seen:
-                            seen.add(nxt)
+                        if nxt != gate and nxt not in region:
                             region.add(nxt)
                             queue.append(nxt)
-                regions.append(region)
-            size = sum(map(len, regions))
+                if not queue and len(region) <= limit:
+                    seen.update(region)
+                    regions.append(region)
             for region in regions:
-                if 2 * len(region) > size:
-                    continue
                 distances = {pos: 1 for pos in neighbors[gate] if pos in region}
                 queue = deque(distances)
                 while queue:
@@ -223,7 +269,12 @@ class GhostAgent(BaseGhostAgent):
 
     def _prepare_maximin_strategy(self):
         # Khởi tạo bảng sống sót cho mọi cặp vị trí và các nước hợp lệ của hai bên.
-        if self.maximin_strategy is not None or len(self.ghost_actions) > MAX_TABLE_CELLS:
+        if self.maximin_strategy is not None:
+            return
+        size = len(self.ghost_actions)
+        # Account for bounded policy tables and NumPy gather temporaries.
+        width = max(map(len, self.pacman_targets.values()))
+        if size * size * (80 + width) > MAX_TABLE_BYTES:
             return
         cells = sorted(self.ghost_actions)
         index = {pos: i for i, pos in enumerate(cells)}
@@ -236,8 +287,9 @@ class GhostAgent(BaseGhostAgent):
             pacman = [index[nxt] for nxt in self.pacman_targets[pos]]
             ghost_moves.append(ghost + [index[pos]] * (ghost_width - len(ghost)))
             pacman_moves.append(pacman + [index[pos]] * (pacman_width - len(pacman)))
-        coordinates = np.asarray(cells)
-        safe = (np.abs(coordinates[:, None] - coordinates[None, :]).sum(axis=2)
+        coordinates = np.asarray(cells, dtype=np.int32)
+        safe = (np.abs(coordinates[:, None, 0] - coordinates[None, :, 0])
+                + np.abs(coordinates[:, None, 1] - coordinates[None, :, 1])
                 >= self.capture_distance)
         # Bảng trạng thái có hai trục: [chỉ số ô Ghost, chỉ số ô Pacman].
         # ranks = 0: đã bị bắt; k > 0: Pacman tối ưu buộc bắt trong tối đa k lượt.
@@ -271,18 +323,7 @@ class GhostAgent(BaseGhostAgent):
         while (not strategy['solved'] and strategy['ranks'][ghost_index, pacman_index] < 0
                and strategy['depth'] < remaining and time.perf_counter() < stop):
             self._check_time()
-            survivable = strategy['alive']
-            # all xét mọi nước Pacman cho từng ô Ghost có thể tới.
-            # any tìm một nước Ghost sống được trước tất cả các phản ứng đó.
-            safe_responses = survivable[:, strategy['pacman_moves']].all(axis=2)
-            next_survivable = safe_responses[strategy['ghost_moves']].any(axis=1)
-            next_survivable &= strategy['safe']
-            lost = survivable & ~next_survivable
-            depth = strategy['depth'] + 1
-            strategy['ranks'][lost] = depth
-            strategy['alive'] = next_survivable
-            strategy['depth'] = depth
-            strategy['solved'] = not lost.any()
+            self._advance_maximin_once()
         self._check_time()
         if (not strategy['solved'] and strategy['ranks'][ghost_index, pacman_index] < 0
                 and strategy['depth'] < remaining):
@@ -295,22 +336,42 @@ class GhostAgent(BaseGhostAgent):
             # Tuple tăng dần giúp so kết quả xấu nhất trước, rồi mới các kết quả còn lại.
             outcomes = tuple(sorted(remaining if value < 0 else
                                     min(remaining, int(value)) for value in values))
-            score = (outcomes, self._evaluate(pos, pacman),
+            predicted = 0.0
+            if self.policy_tiebreak and self.belief is not None:
+                policy = self._pursuit_policy(ghost)[self.belief['index'][pacman]]
+                unknown = remaining if strategy['solved'] else min(remaining, strategy['depth'] + 1)
+                lifetimes = np.where(values < 0, unknown, np.minimum(values, remaining))
+                predicted = float(lifetimes @ policy[:len(targets)])
+            score = (outcomes[0], predicted, outcomes, self._evaluate(pos, pacman),
                      -self.visits[pos], move != Move.STAY)
             if best_score is None or score > best_score:
                 best_move, best_score = move, score
         return best_move
 
-    def _bfs_model_supported(self):
-        # Kiểm tra giả thuyết đối thủ dùng BFS còn khớp và đủ tin cậy để áp dụng.
-        bfs_weight = self.model_weights[MODEL_BFS]
-        bfs_is_likely = bfs_weight >= self.model_weights[MODEL_GREEDY_VERTICAL:].max()
-        repeated_matches = self.bfs_observations >= MIN_MODEL_OBSERVATIONS
-        reliable_under_fog = (not self.fog_enabled
-                              or (self.model_observations >= MIN_MODEL_OBSERVATIONS
-                                  and bfs_weight >= MODEL_CONFIDENCE_THRESHOLD))
-        return (self.bfs_consistent and (bfs_is_likely or repeated_matches)
-                and reliable_under_fog)
+    def _advance_maximin_once(self):
+        strategy = self.maximin_strategy
+        survivable = strategy['alive']
+        safe_responses = survivable[:, strategy['pacman_moves']].all(axis=2)
+        following = safe_responses[strategy['ghost_moves']].any(axis=1)
+        following &= strategy['safe']
+        lost = survivable & ~following
+        depth = strategy['depth'] + 1
+        strategy['ranks'][lost] = depth
+        strategy['alive'], strategy['depth'] = following, depth
+        strategy['solved'] = not lost.any()
+
+    def _policy_model_supported(self):
+        # A prior is not evidence. Bayesian weights can recover after a mismatch.
+        candidates = RESPONSE_MODELS if self.learned_tables else RESPONSE_MODELS[:4]
+        self.response_model = max(candidates,
+                             key=lambda model: self.model_weights[model])
+        weight = self.model_weights[self.response_model]
+        matches = self.model_streaks[self.response_model]
+        supported = (weight >= MODEL_CONFIDENCE_THRESHOLD
+                     or (matches >= MIN_MODEL_OBSERVATIONS
+                         and weight >= 0.95 * self.model_weights.max()))
+        return ((self.model_observations >= MIN_MODEL_OBSERVATIONS and matches > 0 and supported)
+                or (self.model_observations >= 1 and matches > 0 and weight >= 0.75))
 
     def _choose_visible_move(self, actions, ghost, pacman, remaining):
         # Khi thấy Pacman, ưu tiên maximin rồi xét BFS hoặc kiểu đuổi đã học.
@@ -325,11 +386,26 @@ class GhostAgent(BaseGhostAgent):
         # Chỉ thử mô hình đối thủ khi phương án bảo thủ đã chứng minh sẽ thua.
         if not 0 < capture_turn <= remaining:
             return best_move
-        if self._bfs_model_supported():
-            bfs_move = self._choose_bfs_survival_move(actions, ghost, pacman, remaining)
-            if bfs_move is not None:
-                self.decision_mode = 'bfs_survival'
-                return bfs_move
+        # On maps where robust evasion is impossible, a common chase policy may
+        # still admit an infinite escape cycle. Prefer that opening opportunity
+        # only when its table has actually converged; this is a prior-based
+        # choice, not evidence that the opponent follows that policy.
+        opening_supported = (self.model_observations == 0
+                             or (self.model_observations == 1 and self.model_streaks[MODEL_BFS] > 0
+                                 and self.model_weights[MODEL_BFS] >= self.model_weights.max() * 0.95))
+        if not self.fog_enabled and opening_supported:
+            opening = self._choose_policy_survival_move(actions, ghost, pacman, remaining)
+            table = self.policy_strategy
+            if (opening is not None and table['solved']
+                    and table['ranks'][index[ghost], index[pacman]] < 0):
+                self.decision_mode = 'opening_survival'
+                return opening
+        if self._policy_model_supported():
+            policy_move = self._choose_policy_survival_move(actions, ghost, pacman, remaining,
+                                                          self.response_model)
+            if policy_move is not None:
+                self.decision_mode = 'policy_survival'
+                return policy_move
         if self._model_exploitable():
             self._prepare_belief()
             if self.belief is not None:
@@ -358,40 +434,98 @@ class GhostAgent(BaseGhostAgent):
             self.ordered_target_cache[pos] = tuple(targets)
         return self.ordered_target_cache[pos]
 
-    def _prepare_bfs_strategy(self):
+    def _prepare_policy_strategy(self, model=MODEL_BFS):
         # Khởi tạo bảng nước đi BFS dự đoán và bảng sống sót cho mọi cặp vị trí.
-        if self.bfs_response_strategy is not None:
+        if model in self.policy_strategies:
+            self.policy_strategies.move_to_end(model)
+            self.policy_strategy = self.policy_strategies[model]
             return
         self._prepare_maximin_strategy()
         if self.maximin_strategy is None:
             return
-        nodes = sorted(self.ghost_actions)
+        self._prepare_belief()
+        if self.belief is None:
+            return
+        self.policy_strategy = None
+        nodes = self.belief['nodes']
         index = self.maximin_strategy['index']
-        ordered, distances = [], []
-        for ghost in nodes:
-            self._check_time()
-            ordered.append([index[pos] for pos in self._ordered_pacman_targets(ghost)])
-            distance = self._distance_map(ghost)
-            distances.append([distance.get(pos, UNREACHABLE_DISTANCE) for pos in nodes])
-        ordered = np.asarray(ordered, dtype=np.int32)
-        costs = np.asarray(distances, dtype=np.int32)[:, ordered]
-        # policy[g, p] là ô Pacman dự đoán sẽ tới khi nhắm vị trí Ghost cũ.
-        # argmin lấy đích đầu tiên khi hòa, theo thứ tự Move của mô hình BFS này.
-        policy = ordered[np.arange(len(nodes))[None, :], costs.argmin(axis=2)]
+        size = len(nodes)
+        greedy = model in (MODEL_GREEDY_VERTICAL, MODEL_GREEDY_HORIZONTAL)
+        policy_width = 4 if greedy else 1
+        if model not in self.policy_builders:
+            # Only the currently selected model needs an unfinished allocation.
+            self.policy_builders.clear()
+            self.policy_builders[model] = dict(policy=np.empty((size, size, policy_width), dtype=np.int32), built=0)
+        builder = self.policy_builders[model]
+        rows = np.arange(size)
+        now = time.perf_counter()
+        stop = now + max(0, self.deadline - now) * STRATEGY_TIME_FRACTION
+        while builder['built'] < size:
+            if time.perf_counter() >= stop:
+                return
+            row = builder['built']
+            ghost = nodes[row]
+            if greedy:
+                end = min(size, row + 64)
+                builder['policy'][row:end] = self._greedy_policy_chunk(row, end, model)
+                builder['built'] = end
+                continue
+            else:
+                ordered = self.belief['ordered']
+                if model == MODEL_BFS_REVERSE:
+                    ordered = ordered[:, ::-1]
+                elif model == MODEL_BFS_SLOW:
+                    ordered = ordered[:, ::ordered.shape[1] // len(Move)]
+                distances = self._distance_map(ghost)
+                costs = np.asarray([distances.get(pos, UNREACHABLE_DISTANCE) for pos in nodes])
+                builder['policy'][row, :, 0] = (self._intercept_targets(ghost, costs)
+                    if model == MODEL_INTERCEPT else ordered[rows, costs[ordered].argmin(axis=1)])
+            builder['built'] += 1
+        policy = builder['policy']
         safe = self.maximin_strategy['safe']
         ranks = np.full(safe.shape, -1, dtype=np.int32)
         ranks[~safe] = 0
         self._check_time()
-        self.bfs_response_strategy = {
+        self.policy_strategy = {
             'index': index, 'policy': policy, 'ranks': ranks,
             'alive': safe.copy(), 'depth': 0, 'solved': False,
+            'branches': np.where((policy != policy[:, :, :1]).any(axis=2)),
         }
+        self.policy_strategies[model] = self.policy_strategy
+        if len(self.policy_strategies) > 2:
+            self.policy_strategies.popitem(last=False)
+        del self.policy_builders[model]
 
-    def _choose_bfs_survival_move(self, actions, ghost, pacman, remaining):
+    def _greedy_policy_chunk(self, first, end, model):
+        """All greedy responses for a block of Ghost cells, without any BFS."""
+        belief = self.belief
+        coordinates = belief['coordinates']
+        size = len(coordinates)
+        rows = np.arange(size)[None, :]
+        stride = belief['ordered'].shape[1] // len(Move)
+        directional = belief['ordered'].reshape(size, len(Move), stride)
+        dr = coordinates[first:end, None, 0] - coordinates[None, :, 0]
+        dc = coordinates[first:end, None, 1] - coordinates[None, :, 1]
+        vertical = directional[rows, np.where(dr > 0, 1, 0),
+                               np.maximum(0, np.minimum(np.abs(dr), stride) - 1)]
+        horizontal = directional[rows, np.where(dc > 0, 3, 2),
+                                 np.maximum(0, np.minimum(np.abs(dc), stride) - 1)]
+        vertical = np.where(dr != 0, vertical, rows)
+        horizontal = np.where(dc != 0, horizontal, rows)
+        primary, secondary = ((vertical, horizontal) if model == MODEL_GREEDY_VERTICAL
+                              else (horizontal, vertical))
+        selected = np.where(primary != rows, primary, secondary)
+        fallback = directional[:, :4, -1]
+        moving = fallback != np.arange(size)[:, None]
+        first_fallback = fallback[np.arange(size), moving.argmax(axis=1)]
+        fallback = np.where(moving, fallback, first_fallback[:, None])
+        return np.where((selected != rows)[:, :, None], selected[:, :, None], fallback[None, :, :])
+
+    def _choose_policy_survival_move(self, actions, ghost, pacman, remaining, model=MODEL_BFS):
         # Chọn Move kéo dài thời gian sống nhất trước chính sách BFS giả định.
         # Trả None nếu bảng chưa tính đủ để quyết định.
-        self._prepare_bfs_strategy()
-        response_table = self.bfs_response_strategy
+        self._prepare_policy_strategy(model)
+        response_table = self.policy_strategy
         if response_table is None:
             return None
         index = response_table['index']
@@ -402,11 +536,18 @@ class GhostAgent(BaseGhostAgent):
                and response_table['ranks'][ghost_index, pacman_index] < 0
                and response_table['depth'] < remaining and time.perf_counter() < stop):
             self._check_time()
-            # Broadcast tạo các nhánh [ô Ghost, lựa chọn Ghost, ô Pacman].
-            # Pacman chỉ dùng nước dự đoán của mô hình BFS; any chọn nhánh Ghost sống được.
-            ghost_moves = self.maximin_strategy['ghost_moves'][:, :, None]
-            pacman_moves = response_table['policy'][:, None, :]
-            next_survivable = response_table['alive'][ghost_moves, pacman_moves].any(axis=1)
+            # First evaluate the deterministic response, then refine only states
+            # with multiple supported responses (e.g. random greedy fallbacks).
+            ghost_moves = self.maximin_strategy['ghost_moves']
+            policy = response_table['policy']
+            responses = response_table['alive'][ghost_moves[:, :, None], policy[:, None, :, 0]]
+            branch_ghosts, branch_pacmen = response_table['branches']
+            if len(branch_ghosts):
+                alternatives = response_table['alive'][
+                    ghost_moves[branch_ghosts, :, None],
+                    policy[branch_ghosts, branch_pacmen][:, None, :]]
+                responses[branch_ghosts, :, branch_pacmen] = alternatives.all(axis=2)
+            next_survivable = responses.any(axis=1)
             next_survivable &= self.maximin_strategy['safe']
             lost = response_table['alive'] & ~next_survivable
             depth = response_table['depth'] + 1
@@ -418,12 +559,12 @@ class GhostAgent(BaseGhostAgent):
                 and response_table['ranks'][ghost_index, pacman_index] < 0
                 and response_table['depth'] < remaining):
             return None
-        predicted_pacman_index = response_table['policy'][ghost_index, pacman_index]
+        predicted_pacman_indices = response_table['policy'][ghost_index, pacman_index]
         best_move, best_score = None, None
         for move, pos in actions:
             self._check_time()
-            rank = int(response_table['ranks'][index[pos], predicted_pacman_index])
-            lifetime = remaining if rank < 0 else min(remaining, rank)
+            ranks = response_table['ranks'][index[pos], predicted_pacman_indices]
+            lifetime = min(remaining if rank < 0 else min(remaining, int(rank)) for rank in ranks)
             safe = all(self._manhattan(pos, enemy) >= self.capture_distance
                        for enemy in self.pacman_targets[pacman])
             score = (lifetime, safe, self._evaluate(pos, pacman),
@@ -437,6 +578,10 @@ class GhostAgent(BaseGhostAgent):
         if start not in self.pacman_turn_cache:
             self.pacman_turn_cache[start] = self._breadth_first_distances(
                 (start,), pacman=True)
+            if len(self.pacman_turn_cache) > DISTANCE_CACHE_SIZE:
+                self.pacman_turn_cache.popitem(last=False)
+        else:
+            self.pacman_turn_cache.move_to_end(start)
         return self.pacman_turn_cache[start]
 
     def _update_belief(self, grid, enemy, step_number):
@@ -466,7 +611,7 @@ class GhostAgent(BaseGhostAgent):
 
     def _prepare_belief(self):
         # Khởi tạo chỉ số ô, đích di chuyển, mặt nạ bắt và cache phục vụ suy đoán Pacman.
-        if self.belief is not None or len(self.ghost_actions) > MAX_TABLE_CELLS:
+        if self.belief is not None or len(self.ghost_actions) > MAX_BELIEF_CELLS:
             return
         nodes = sorted(self.ghost_actions)
         index = {pos: i for i, pos in enumerate(nodes)}
@@ -476,8 +621,9 @@ class GhostAgent(BaseGhostAgent):
             self._check_time()
             targets = [index[nxt] for nxt in self.pacman_targets[pos]]
             edges.append(targets + [index[pos]] * (width - len(targets)))
-        coordinates = np.asarray(nodes)
-        capture = (np.abs(coordinates[:, None] - coordinates[None, :]).sum(axis=2)
+        coordinates = np.asarray(nodes, dtype=np.int32)
+        capture = (np.abs(coordinates[:, None, 0] - coordinates[None, :, 0])
+                   + np.abs(coordinates[:, None, 1] - coordinates[None, :, 1])
                    < self.capture_distance)
         self._check_time()
         self.belief = {
@@ -485,9 +631,15 @@ class GhostAgent(BaseGhostAgent):
             'index': index,
             'edges': np.asarray(edges, dtype=np.int32),
             'capture': capture,
-            'policies': {},
-            'models': {},
-            'geometry': {},
+            'coordinates': coordinates,
+            'counts': np.asarray([len(self.pacman_targets[pos]) for pos in nodes]),
+            'ordered': np.asarray([[index[target] for target in self._ordered_pacman_targets(pos)]
+                                   for pos in nodes], dtype=np.int32),
+            'policies': OrderedDict(),
+            'models': OrderedDict(),
+            'geometry': OrderedDict(),
+            'cache_limit': max(2, min(MODEL_CACHE_SIZE,
+                                     (8 * 1024 * 1024) // (len(self.model_prior) * len(nodes) * width * 4))),
             'probabilities': None,
             'observer': None,
             'step': None,
@@ -501,8 +653,7 @@ class GhostAgent(BaseGhostAgent):
             return
         nodes, index = belief['nodes'], belief['index']
         learned = None
-        bfs_consistent = self.bfs_consistent
-        bfs_observations = self.bfs_observations
+        streaks = self.model_streaks
         if enemy is not None:
             if self.last_sighting is not None:
                 previous, observer, previous_step = self.last_sighting
@@ -510,18 +661,13 @@ class GhostAgent(BaseGhostAgent):
                 # observer là vị trí Ghost lượt trước vì hai bên di chuyển đồng thời.
                 if previous_step + 1 == step_number:
                     models = self._pursuit_models(observer)
-                    predicted = min(
-                        self._ordered_pacman_targets(previous),
-                        key=lambda pos: self._distance_map(observer).get(
-                            pos, UNREACHABLE_DISTANCE))
-                    bfs_consistent = bfs_consistent and predicted == enemy
-                    bfs_observations = bfs_observations + 1 if predicted == enemy else 0
                     outcomes = belief['edges'][index[previous]] == index[enemy]
                     likelihood = models[:, index[previous], outcomes].sum(axis=1)
+                    streaks = np.where(likelihood > 0, np.minimum(streaks + 1, 1000), 0)
                     if likelihood.sum() > 0:
                         # Giữ một ít prior để mô hình tạm chưa khớp vẫn có thể phục hồi.
-                        learned = self.model_weights * (likelihood + 0.02)
-                        learned = 0.98 * learned / learned.sum() + 0.02 * self.model_prior
+                        learned = self.model_weights * (likelihood + 0.04)
+                        learned = 0.95 * learned / learned.sum() + 0.05 * self.model_prior
             probabilities = np.zeros(len(nodes))
             probabilities[index[enemy]] = 1
         else:
@@ -542,6 +688,8 @@ class GhostAgent(BaseGhostAgent):
             # Loại các ô không còn khả thi theo quan sát và khả năng di chuyển.
             # Thêm xác suất nhỏ trên các ô còn hợp lệ trước khi chuẩn hóa về tổng 1.
             mask = np.asarray([pos in self.possible_enemies for pos in nodes])
+            # Being alive is also an observation, including diagonal capture zones.
+            mask &= ~belief['capture'][index[self.current_position]]
             probabilities *= mask
             if probabilities.sum() <= 1e-12:
                 probabilities = mask.astype(float)
@@ -551,10 +699,9 @@ class GhostAgent(BaseGhostAgent):
                 return
             probabilities /= mass
         self._check_time()
-        self.bfs_consistent = bfs_consistent
-        self.bfs_observations = bfs_observations
         if learned is not None:
             self.model_weights = learned
+            self.model_streaks = streaks
             self.model_observations += 1
             belief['policies'].clear()
         belief['probabilities'] = probabilities
@@ -567,79 +714,102 @@ class GhostAgent(BaseGhostAgent):
         # Trả ma trận [ô Pacman, lựa chọn đích], trộn các kiểu đuổi nhắm vị trí ghost.
         belief = self.belief
         if ghost in belief['policies']:
+            belief['policies'].move_to_end(ghost)
             return belief['policies'][ghost]
         models = self._pursuit_models(ghost)
-        weights = np.tensordot(self.model_weights, models, axes=(0, 0))
+        prior = self.fog_prior if self.fog_enabled and self.model_observations == 0 else self.model_weights
+        weights = np.tensordot(prior, models, axes=(0, 0))
         self._check_time()
         belief['policies'][ghost] = weights
+        if len(belief['policies']) > belief['cache_limit']:
+            belief['policies'].popitem(last=False)
         return weights
 
     def _pursuit_models(self, ghost):
-        # Tạo bốn kiểu đuổi nhắm ghost: BFS, ưu tiên dọc, ưu tiên ngang và ngẫu nhiên.
+        # Evaluate all source cells together; padded edges must carry zero mass.
         belief = self.belief
         if ghost in belief['models']:
+            belief['models'].move_to_end(ghost)
             return belief['models'][ghost]
-        # models[kiểu đối thủ, ô Pacman hiện tại, lựa chọn đích] là xác suất chuyển ô.
-        models = np.zeros((len(self.model_prior),) + belief['edges'].shape)
         distances = self._distance_map(ghost)
-        for pacman_index, pacman in enumerate(belief['nodes']):
-            self._check_time()
-            targets = self.pacman_targets[pacman]
-            costs = [distances.get(pos, UNREACHABLE_DISTANCE) for pos in targets]
-            closest = min(costs)
-            count = costs.count(closest)
-            for endpoint_index, cost in enumerate(costs):
-                models[MODEL_BFS, pacman_index, endpoint_index] = (cost == closest) / count
-                models[MODEL_RANDOM, pacman_index, endpoint_index] = 1 / len(targets)
-            dr, dc = ghost[0] - pacman[0], ghost[1] - pacman[1]
-            vertical = Move.DOWN if dr > 0 else Move.UP if dr < 0 else None
-            horizontal = Move.RIGHT if dc > 0 else Move.LEFT if dc < 0 else None
-            preferences = ((vertical, horizontal), (horizontal, vertical))
-            for model, preferred in enumerate(preferences, MODEL_GREEDY_VERTICAL):
-                selected = None
-                for direction in preferred:
-                    if direction is None:
-                        continue
-                    steps = min(self.pacman_speed, abs(dr) if direction in
-                                (Move.UP, Move.DOWN) else abs(dc))
-                    pos = pacman
-                    for _ in range(steps):
-                        rr, cc = direction.value
-                        nxt = (pos[0] + rr, pos[1] + cc)
-                        if nxt not in self.ghost_actions:
-                            break
-                        pos = nxt
-                    if pos != pacman:
-                        selected = pos
-                        break
-                if selected is not None:
-                    models[model, pacman_index, targets.index(selected)] = 1
-                else:
-                    endpoints = []
-                    for direction in (Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT):
-                        pos = pacman
-                        for _ in range(self.pacman_speed):
-                            rr, cc = direction.value
-                            nxt = (pos[0] + rr, pos[1] + cc)
-                            if nxt not in self.ghost_actions:
-                                break
-                            pos = nxt
-                        if pos != pacman:
-                            endpoints.append(pos)
-                    if not endpoints:
-                        endpoints = [pacman]
-                    for pos in endpoints:
-                        models[model, pacman_index, targets.index(pos)] += 1 / len(endpoints)
+        edges, counts, ordered = belief['edges'], belief['counts'], belief['ordered']
+        size, width = edges.shape
+        rows = np.arange(size)
+        models = np.zeros((len(self.model_prior), size, width), dtype=np.float32)
+        distance = np.asarray([distances.get(pos, UNREACHABLE_DISTANCE) for pos in belief['nodes']])
+        valid = np.arange(width)[None, :] < counts[:, None]
+        costs = np.where(valid, distance[edges], np.inf)
+        closest = valid & (costs == costs.min(axis=1, keepdims=True))
+        models[MODEL_BFS_RANDOM] = closest / closest.sum(axis=1, keepdims=True)
+        models[MODEL_RANDOM] = valid / counts[:, None]
+        stride = ordered.shape[1] // len(Move)
+        for model, choices in ((MODEL_BFS, ordered),
+                               (MODEL_BFS_REVERSE, ordered[:, ::-1]),
+                               (MODEL_BFS_SLOW, ordered[:, ::stride])):
+            endpoints = choices[rows, distance[choices].argmin(axis=1)]
+            slots = (edges == endpoints[:, None]).argmax(axis=1)
+            models[model, rows, slots] = 1
+
+        endpoints = self._intercept_targets(ghost, distance)
+        slots = (edges == endpoints[:, None]).argmax(axis=1)
+        models[MODEL_INTERCEPT, rows, slots] = 1
+
+        directional = ordered.reshape(size, len(Move), stride)
+        dr = ghost[0] - belief['coordinates'][:, 0]
+        dc = ghost[1] - belief['coordinates'][:, 1]
+        vertical = directional[rows, np.where(dr > 0, 1, 0),
+                               np.maximum(0, np.minimum(np.abs(dr), stride) - 1)]
+        horizontal = directional[rows, np.where(dc > 0, 3, 2),
+                                 np.maximum(0, np.minimum(np.abs(dc), stride) - 1)]
+        vertical = np.where(dr != 0, vertical, rows)
+        horizontal = np.where(dc != 0, horizontal, rows)
+        fallback = directional[:, :4, -1]
+        moving = fallback != rows[:, None]
+        fallback_counts = moving.sum(axis=1)
+        for model, first, second in ((MODEL_GREEDY_VERTICAL, vertical, horizontal),
+                                     (MODEL_GREEDY_HORIZONTAL, horizontal, vertical)):
+            endpoints = np.where(first != rows, first, second)
+            chosen = endpoints != rows
+            slots = (edges == endpoints[:, None]).argmax(axis=1)
+            models[model, rows[chosen], slots[chosen]] = 1
+            for direction in range(4):
+                active = ~chosen & moving[:, direction]
+                slots = (edges == fallback[:, direction, None]).argmax(axis=1)
+                models[model, rows[active], slots[active]] += 1 / fallback_counts[active]
+            stuck = ~chosen & (fallback_counts == 0)
+            slots = (edges == rows[:, None]).argmax(axis=1)
+            models[model, rows[stuck], slots[stuck]] = 1
         self._check_time()
         belief['models'][ghost] = models
+        if len(belief['models']) > belief['cache_limit']:
+            belief['models'].popitem(last=False)
         return models
+
+    def _intercept_targets(self, ghost, distance):
+        belief = self.belief
+        ordered = belief['ordered']
+        ghost_targets = np.asarray([pos for _, pos in self.ghost_actions[ghost]], dtype=np.int32)
+        coordinates = belief['coordinates'][ordered]
+        differences = (np.abs(coordinates[:, :, None, 0] - ghost_targets[None, None, :, 0])
+                       + np.abs(coordinates[:, :, None, 1] - ghost_targets[None, None, :, 1]))
+        escape_counts = (differences >= self.capture_distance).sum(axis=2)
+        eligible = escape_counts == escape_counts.min(axis=1, keepdims=True)
+        worst_distance = differences.max(axis=2)
+        best_distance = np.where(eligible, worst_distance, np.inf).min(axis=1, keepdims=True)
+        eligible &= worst_distance == best_distance
+        maze_cost = distance[ordered]
+        best_cost = np.where(eligible, maze_cost, np.inf).min(axis=1, keepdims=True)
+        eligible &= maze_cost == best_cost
+        return ordered[np.arange(len(ordered)), eligible.argmax(axis=1)]
 
     def _model_exploitable(self):
         # Trả True khi đủ quan sát và một kiểu greedy chiếm trọng số cao để dự đoán.
         greedy_weight = max(self.model_weights[MODEL_GREEDY_VERTICAL],
                             self.model_weights[MODEL_GREEDY_HORIZONTAL])
-        return (self.model_observations >= MIN_MODEL_OBSERVATIONS
-                and greedy_weight >= MODEL_CONFIDENCE_THRESHOLD)
+        weight = max(greedy_weight, self.model_weights[MODEL_BFS_RANDOM])
+        return ((self.model_observations >= MIN_MODEL_OBSERVATIONS
+                 and weight >= MODEL_CONFIDENCE_THRESHOLD)
+                or (self.model_observations >= 1 and weight >= 0.75))
 
     def _visible_from(self, pos):
         # Trả các ô thấy từ pos theo hình chữ thập, giới hạn bởi tường và vision_radius.
@@ -692,6 +862,10 @@ class GhostAgent(BaseGhostAgent):
                       and bool(directions & {Move.LEFT, Move.RIGHT}))
             self._check_time()
             geometry[pos] = (np.asarray(space), np.asarray(delay), int(corner))
+            if len(geometry) > DISTANCE_CACHE_SIZE:
+                geometry.popitem(last=False)
+        else:
+            geometry.move_to_end(pos)
         return geometry[pos]
 
     def _forecast(self, probabilities, ghost):
@@ -708,11 +882,10 @@ class GhostAgent(BaseGhostAgent):
         # Beam search chọn nước có xác suất sống sót cao và vị trí thuận lợi.
         # allowed giới hạn nước đầu tiên; best_move là dự phòng nếu hết giờ.
         belief = self.belief
-        # Mỗi nhánh giữ nước đi đầu tiên để trả về sau khi xét sâu hơn.
-        # Beam search chỉ giữ FORECAST_BEAM_WIDTH nhánh tốt nhất ở mỗi độ sâu.
+        horizon = min(self.forecast_horizon, self.max_depth, remaining)
         states = [(self.current_position, belief['probabilities'], None)]
         try:
-            for depth in range(1, min(FORECAST_HORIZON, self.max_depth, remaining) + 1):
+            for depth in range(1, horizon + 1):
                 candidates = []
                 for ghost, probabilities, first in states:
                     prediction = self._forecast(probabilities, ghost)
@@ -731,7 +904,7 @@ class GhostAgent(BaseGhostAgent):
                         turn_delay = float(following @ turns)
                         utility = (10000 * mass + 0.4 * space
                                    + 0.25 * mass * information + 0.3 * turn_delay
-                                   + 0.2 * mass * corner
+                                   + 0.2 * mass * (corner + 0.5 * (len(self.ghost_actions[pos]) > 3))
                                    + mass * (len(self.ghost_actions[pos]) - 1
                                              - 4 * (pos in self.trapped)
                                              - 0.1 * self.visits[pos]))
@@ -744,9 +917,22 @@ class GhostAgent(BaseGhostAgent):
                     if key not in seen:
                         unique.append(candidate)
                         seen.add(key)
+                if not unique:
+                    break
                 best_move = unique[0][1]
+                # Reserve a branch for each first action; one action must not crowd
+                # every alternative out before its escape route comes into view.
+                leaders = {}
+                for candidate in unique:
+                    leaders.setdefault(candidate[1], candidate)
+                selected = list(leaders.values())
+                for candidate in unique:
+                    if len(selected) >= self.forecast_beam_width:
+                        break
+                    if candidate is not leaders[candidate[1]]:
+                        selected.append(candidate)
                 states = [(pos, probabilities, first)
-                          for _, first, pos, probabilities in unique[:FORECAST_BEAM_WIDTH]]
+                          for _, first, pos, probabilities in selected]
         except SearchTimeout:
             pass
         return best_move
@@ -755,30 +941,55 @@ class GhostAgent(BaseGhostAgent):
         # Trả {ô: số bước ngắn nhất từ start} và lưu cache; bỏ các ô không tới được.
         if start not in self.maze_distance_cache:
             self.maze_distance_cache[start] = self._breadth_first_distances((start,))
+            if len(self.maze_distance_cache) > DISTANCE_CACHE_SIZE:
+                self.maze_distance_cache.popitem(last=False)
+        else:
+            self.maze_distance_cache.move_to_end(start)
         return self.maze_distance_cache[start]
 
     def _expand_enemies(self, enemies):
         # Trả tập đích Pacman có thể tới sau một lượt từ bất kỳ ô nào trong enemies.
+        key = frozenset(enemies)
+        cached = self.expansion_cache.get(key)
+        if cached is not None:
+            self.expansion_cache.move_to_end(key)
+            return cached
         expanded = set()
-        for pos in enemies:
-            self._check_time()
+        for count, pos in enumerate(enemies):
+            if count & 31 == 0:
+                self._check_time()
             expanded.update(self.pacman_targets[pos])
+        expanded = frozenset(expanded)
+        self.expansion_cache[key] = expanded
+        if len(self.expansion_cache) > 32:
+            self.expansion_cache.popitem(last=False)
         return expanded
 
     def _breadth_first_distances(self, starts, pacman=False):
         # BFS nhiều nguồn: trả số cạnh ít nhất từ starts tới từng ô có thể tới.
         # pacman=True dùng nước đi tối đa pacman_speed ô làm một cạnh (một lượt).
+        key = (frozenset(starts), pacman) if len(starts) > 1 else None
+        if key is not None and key in self.multi_distance_cache:
+            self.multi_distance_cache.move_to_end(key)
+            return self.multi_distance_cache[key]
         distances = dict.fromkeys(starts, 0)
         queue = deque(starts)
+        iterations = 0
         while queue:
-            self._check_time()
+            if iterations & 31 == 0:
+                self._check_time()
+            iterations += 1
             pos = queue.popleft()
             neighbors = (self.pacman_targets[pos] if pacman else
-                         (nxt for _, nxt in self.ghost_actions[pos]))
+                         self.ghost_neighbors[pos])
             for nxt in neighbors:
                 if nxt not in distances:
                     distances[nxt] = distances[pos] + 1
                     queue.append(nxt)
+        if key is not None:
+            self.multi_distance_cache[key] = distances
+            if len(self.multi_distance_cache) > 32:
+                self.multi_distance_cache.popitem(last=False)
         return distances
 
     def _safety_score(self, ghost, distance, pacman_turns):
@@ -893,10 +1104,19 @@ class GhostAgent(BaseGhostAgent):
 
     def _evaluate(self, ghost, pacman):
         # Chấm điểm cặp vị trí Ghost/Pacman; điểm cao nghĩa là Ghost thuận lợi hơn.
+        key = (ghost, pacman)
+        cached = self.evaluation_cache.get(key)
+        if cached is not None:
+            self.evaluation_cache.move_to_end(key)
+            return cached
         distance = self._distance_map(pacman).get(ghost, UNREACHABLE_DISTANCE)
         pacman_distances = self._pacman_distance_map(pacman)
-        return (self._safety_score(ghost, distance, pacman_distances)
-                + 0.5 * min(self._manhattan(ghost, pacman), 20))
+        value = (self._safety_score(ghost, distance, pacman_distances)
+                 + 0.5 * min(self._manhattan(ghost, pacman), 20))
+        self.evaluation_cache[key] = value
+        if len(self.evaluation_cache) > 8192:
+            self.evaluation_cache.popitem(last=False)
+        return value
 
     def _check_time(self):
         # Ném SearchTimeout khi hết giờ để bên gọi dùng phương án đã hoàn thành gần nhất.
@@ -973,7 +1193,6 @@ class GhostAgent(BaseGhostAgent):
         Returns:
             Move: One of Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY
         """
-        # TODO: Implement your search algorithm here
         self.deadline = time.perf_counter() + self.time_budget
         self.current_position = my_position
         self.decision_mode = 'fallback'
