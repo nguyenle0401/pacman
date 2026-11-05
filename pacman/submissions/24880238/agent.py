@@ -76,6 +76,7 @@ class GhostAgent(BaseGhostAgent):
         self.search_exploration = max(0.0, float(kwargs.get('search_exploration', 1.0)))
         self.stochastic_survival = bool(kwargs.get('stochastic_survival', False))
         self.capture_cycles = bool(kwargs.get('capture_cycles', True))
+        self.predictive_cycles = bool(kwargs.get('predictive_cycles', True))
         # Memory for limited observation mode
         self.last_known_enemy_pos = None
         self.visits = Counter()
@@ -119,6 +120,12 @@ class GhostAgent(BaseGhostAgent):
         self.capture_last_sighting = None
         self.capture_plan = {}
         self.capture_cache = OrderedDict()
+        self.predictive_last_sighting = None
+        self.predictive_heading = (0, 0)
+        self.predictive_streak = 0
+        self.predictive_distinct = False
+        self.predictive_plan = {}
+        self.predictive_cache = OrderedDict()
 
     @staticmethod
     def _manhattan(a, b):
@@ -444,7 +451,7 @@ class GhostAgent(BaseGhostAgent):
                 return self._forecast_move(remaining, best_move, set(safe) if safe else None)
         return best_move
 
-    def _choose_visible_move(self, actions, ghost, pacman, remaining):
+    def _choose_capture_move(self, actions, ghost, pacman, remaining):
         move = self._choose_visible_base_move(actions, ghost, pacman, remaining)
         if (not self.capture_cycles or move is None or self.fog_enabled
                 or self.vision_radius > 0 or self.maximin_strategy is None):
@@ -490,6 +497,134 @@ class GhostAgent(BaseGhostAgent):
             self.capture_streak = 0
             self.capture_plan.clear()
         return move
+
+    def _choose_visible_move(self, actions, ghost, pacman, remaining):
+        move = self._choose_capture_move(actions, ghost, pacman, remaining)
+        if (not self.capture_cycles or not self.predictive_cycles or move is None
+                or self.fog_enabled or self.vision_radius > 0 or self.maximin_strategy is None):
+            self._reset_predictive_evidence()
+            return move
+        index = self.maximin_strategy['index']
+        g, p = index[ghost], index[pacman]
+        if not 0 < self.maximin_strategy['ranks'][g, p] <= remaining:
+            return move
+        previous = self.predictive_last_sighting
+        previous_heading = self.predictive_heading
+        self.predictive_last_sighting = (pacman, ghost, self.previous_step)
+        try:
+            if (previous is not None and previous[2] is not None
+                    and self.previous_step == previous[2] + 1):
+                predicted = self._predictive_prediction(previous[1], previous[0], previous_heading)
+                self.predictive_heading = (ghost[0] - previous[1][0], ghost[1] - previous[1][1])
+                if predicted == pacman:
+                    self.predictive_streak += 1
+                    # Require evidence distinguishing motion prediction from
+                    # ordinary pursuit, rather than activating on a shared prefix.
+                    self.predictive_distinct |= predicted != self._predictive_capture_prediction(previous[1], previous[0])
+                else:
+                    self.predictive_streak = 0
+                    self.predictive_distinct = False
+            else:
+                self.predictive_heading = (0, 0)
+                self.predictive_streak = 0
+                self.predictive_distinct = False
+            if not self.predictive_streak:
+                self.predictive_plan.clear()
+            if self.predictive_streak < CAPTURE_MODEL_MATCHES or not self.predictive_distinct:
+                return move
+            state = (ghost, pacman, self.predictive_heading)
+            if state in self.predictive_plan:
+                self.decision_mode = 'predictive_cycle'
+                return self.predictive_plan[state]
+            if self.decision_mode == 'capture_cycle':
+                return move
+            if self.decision_mode == 'policy_survival' and self.policy_strategy is not None:
+                rank = self.policy_strategy['ranks'][g, p]
+                if rank < 0 or rank > remaining:
+                    return move
+            plan = self._find_predictive_cycle(*state)
+            if plan:
+                self.predictive_plan = plan
+                self.decision_mode = 'predictive_cycle'
+                return plan[state]
+        except SearchTimeout:
+            self._reset_predictive_evidence()
+        return move
+
+    def _reset_predictive_evidence(self):
+        self.predictive_last_sighting = None
+        self.predictive_heading = (0, 0)
+        self.predictive_streak = 0
+        self.predictive_distinct = False
+        self.predictive_plan.clear()
+
+    def _predictive_prediction(self, ghost, pacman, heading):
+        """Hypothesize an A* opponent aiming two Ghost moves ahead.
+
+        The heading belongs to the observed state, before the simultaneous
+        move. Extrapolation stops at walls and reuses the bounded A* cache.
+        """
+        target = ghost
+        for _ in range(2):
+            following = (target[0] + heading[0], target[1] + heading[1])
+            if following not in self.ghost_actions:
+                break
+            target = following
+        return self._predictive_capture_prediction(target, pacman)
+
+    def _predictive_capture_prediction(self, target, pacman):
+        """Use a separate cache so hypothesis testing leaves the old model alone."""
+        key = (target, pacman)
+        if key in self.predictive_cache:
+            self.predictive_cache.move_to_end(key)
+            return self.predictive_cache[key]
+
+        def heuristic(pos):
+            return max(0, self._manhattan(pos, target) - self.capture_distance
+                       + self.pacman_speed) // self.pacman_speed
+
+        h = heuristic(pacman)
+        queue = [(h, h, 0, pacman, None)]
+        costs, serial, iterations = {pacman: 0}, 0, 0
+        result = pacman
+        while queue:
+            if iterations & 15 == 0:
+                self._check_time()
+            iterations += 1
+            priority, h, _, cell, first = heapq.heappop(queue)
+            if priority - h != costs[cell]:
+                continue
+            if self._manhattan(cell, target) < self.capture_distance:
+                result = first if first is not None else pacman
+                break
+            cost = costs[cell] + 1
+            targets = self.ordered_target_cache.get(cell)
+            if targets is None:
+                # Real model activation follows belief preparation, which has
+                # already built these tuples. Keep direct helper calls pure too.
+                targets = []
+                for move in Move:
+                    current = cell
+                    dr, dc = move.value
+                    for _ in range(min(self.pacman_speed, max(self.topology[0]))):
+                        nxt = (current[0] + dr, current[1] + dc)
+                        if nxt in self.ghost_actions:
+                            current = nxt
+                        targets.append(current)
+            stride = len(targets) // len(Move)
+            for direction in (3, 1, 2, 0):
+                for step in range(stride - 1, -1, -1):
+                    nxt = targets[direction * stride + step]
+                    if cost < costs.get(nxt, float('inf')):
+                        costs[nxt] = cost
+                        serial += 1
+                        nh = heuristic(nxt)
+                        heapq.heappush(queue, (cost + nh, nh, serial, nxt,
+                                               nxt if first is None else first))
+        self.predictive_cache[key] = result
+        if len(self.predictive_cache) > CAPTURE_CACHE_SIZE:
+            self.predictive_cache.popitem(last=False)
+        return result
 
     def _capture_prediction(self, ghost, pacman):
         """Predict a shortest-turn A* chaser, with deterministic tie ordering.
@@ -580,6 +715,46 @@ class GhostAgent(BaseGhostAgent):
             return None
 
         return search((ghost, pacman), CAPTURE_CYCLE_DEPTH)
+
+    def _find_predictive_cycle(self, ghost, pacman, heading):
+        """A closed predictive policy must also return to the same heading."""
+        path, actions, active, failed = [], [], set(), set()
+        now = time.perf_counter()
+        stop = now + max(0, self.deadline - now) * 0.5
+        visits = 0
+
+        def search(state, left):
+            nonlocal visits
+            visits += 1
+            if visits > CAPTURE_CYCLE_NODES or time.perf_counter() >= stop:
+                return None
+            self._check_time()
+            if state in active:
+                return dict(zip(path, actions))
+            if not left or (state, left) in failed:
+                return None
+            g, p, h = state
+            following = self._predictive_prediction(g, p, h)
+            choices = [(move, pos) for move, pos in self.ghost_actions[g]
+                       if self._manhattan(pos, following) >= self.capture_distance]
+            choices.sort(key=lambda action: (self._manhattan(action[1], following),
+                                              len(self.ghost_actions[action[1]]),
+                                              -self.visits[action[1]]), reverse=True)
+            active.add(state)
+            path.append(state)
+            for move, pos in choices:
+                actions.append(move)
+                successor = (pos, following, (pos[0] - g[0], pos[1] - g[1]))
+                plan = search(successor, left - 1)
+                if plan is not None:
+                    return plan
+                actions.pop()
+            path.pop()
+            active.remove(state)
+            failed.add((state, left))
+            return None
+
+        return search((ghost, pacman, heading), CAPTURE_CYCLE_DEPTH)
 
     def _ordered_pacman_targets(self, pos):
         # Liệt kê đích theo thứ tự Move và số bước; giữ đích trùng để phá hòa ổn định.
