@@ -1,4 +1,5 @@
 ﻿"""Ghost: exact survival tables, online pursuit models and bounded fog search."""
+import heapq
 import sys
 import time
 from collections import Counter, OrderedDict, deque
@@ -33,6 +34,10 @@ MIN_MODEL_OBSERVATIONS = 2
 MODEL_CONFIDENCE_THRESHOLD = 0.55
 FORECAST_HORIZON = 4
 FORECAST_BEAM_WIDTH = 8
+CAPTURE_MODEL_MATCHES = 3
+CAPTURE_CYCLE_DEPTH = 12
+CAPTURE_CYCLE_NODES = 1500
+CAPTURE_CACHE_SIZE = 512
 
 
 class SearchTimeout(Exception):
@@ -58,6 +63,19 @@ class GhostAgent(BaseGhostAgent):
         self.forecast_beam_width = max(5, int(kwargs.get('forecast_beam_width', FORECAST_BEAM_WIDTH)))
         self.policy_tiebreak = bool(kwargs.get('policy_tiebreak', True))
         self.learned_tables = bool(kwargs.get('learned_tables', True))
+        # Exact belief identities are available for experiments, but the compact
+        # position beam preserves stronger spatial coverage at the default width.
+        self.belief_merge = kwargs.get('belief_merge', 'position')
+        if self.belief_merge not in ('exact', 'position'):
+            raise ValueError("belief_merge must be 'exact' or 'position'")
+        self.opponent_memory = bool(kwargs.get('opponent_memory', True))
+        # Long waits in narrow corridors can hide an approaching enemy until
+        # capture. Zero retains the unconditional Round 3 memory model.
+        self.memory_stall_limit = max(0, int(kwargs.get('memory_stall_limit', 0)))
+        self.memory_full_prior = min(1.0, max(0.0, float(kwargs.get('memory_full_prior', 0.5))))
+        self.search_exploration = max(0.0, float(kwargs.get('search_exploration', 1.0)))
+        self.stochastic_survival = bool(kwargs.get('stochastic_survival', False))
+        self.capture_cycles = bool(kwargs.get('capture_cycles', True))
         # Memory for limited observation mode
         self.last_known_enemy_pos = None
         self.visits = Counter()
@@ -94,6 +112,13 @@ class GhostAgent(BaseGhostAgent):
         self.vision_radius = 0
         self.visibility_cache = {}
         self.response_model = MODEL_BFS
+        self.memory_stall_steps = 0
+        self.memory_observer = None
+        self.memory_fallback = False
+        self.capture_streak = 0
+        self.capture_last_sighting = None
+        self.capture_plan = {}
+        self.capture_cache = OrderedDict()
 
     @staticmethod
     def _manhattan(a, b):
@@ -373,7 +398,7 @@ class GhostAgent(BaseGhostAgent):
         return ((self.model_observations >= MIN_MODEL_OBSERVATIONS and matches > 0 and supported)
                 or (self.model_observations >= 1 and matches > 0 and weight >= 0.75))
 
-    def _choose_visible_move(self, actions, ghost, pacman, remaining):
+    def _choose_visible_base_move(self, actions, ghost, pacman, remaining):
         # Khi thấy Pacman, ưu tiên maximin rồi xét BFS hoặc kiểu đuổi đã học.
         # Trả Move; None để step chuyển sang tìm kiếm dự phòng.
         best_move = self._choose_maximin_move(actions, ghost, pacman, remaining)
@@ -418,6 +443,143 @@ class GhostAgent(BaseGhostAgent):
                 self.decision_mode = 'exploit'
                 return self._forecast_move(remaining, best_move, set(safe) if safe else None)
         return best_move
+
+    def _choose_visible_move(self, actions, ghost, pacman, remaining):
+        move = self._choose_visible_base_move(actions, ghost, pacman, remaining)
+        if (not self.capture_cycles or move is None or self.fog_enabled
+                or self.vision_radius > 0 or self.maximin_strategy is None):
+            self.capture_last_sighting = None
+            self.capture_streak = 0
+            self.capture_plan.clear()
+            return move
+        index = self.maximin_strategy['index']
+        g, p = index[ghost], index[pacman]
+        if not 0 < self.maximin_strategy['ranks'][g, p] <= remaining:
+            return move
+        previous = self.capture_last_sighting
+        self.capture_last_sighting = (pacman, ghost, self.previous_step)
+        try:
+            if (previous is not None and previous[2] is not None
+                    and self.previous_step == previous[2] + 1):
+                predicted = self._capture_prediction(previous[1], previous[0])
+                self.capture_streak = self.capture_streak + 1 if predicted == pacman else 0
+            else:
+                self.capture_streak = 0
+            if not self.capture_streak:
+                self.capture_plan.clear()
+            if self.capture_streak < CAPTURE_MODEL_MATCHES:
+                return move
+            state = (ghost, pacman)
+            if state in self.capture_plan:
+                self.decision_mode = 'capture_cycle'
+                return self.capture_plan[state]
+            # Preserve a winning response against an already supported model
+            # before introducing another hypothesis. Existing cycles continue
+            # while every observed transition still agrees with their model.
+            if self.decision_mode == 'policy_survival' and self.policy_strategy is not None:
+                rank = self.policy_strategy['ranks'][g, p]
+                if rank < 0 or rank > remaining:
+                    return move
+            plan = self._find_capture_cycle(ghost, pacman)
+            if plan:
+                self.capture_plan = plan
+                self.decision_mode = 'capture_cycle'
+                return plan[state]
+        except SearchTimeout:
+            # The previous decision was completed before this optional search.
+            self.capture_streak = 0
+            self.capture_plan.clear()
+        return move
+
+    def _capture_prediction(self, ghost, pacman):
+        """Predict a shortest-turn A* chaser, with deterministic tie ordering.
+
+        This is an opponent hypothesis checked against visible transitions;
+        it is not assumed to describe every shortest-path opponent.
+        """
+        key = (ghost, pacman)
+        if key in self.capture_cache:
+            self.capture_cache.move_to_end(key)
+            return self.capture_cache[key]
+
+        def heuristic(pos):
+            distance = self._manhattan(pos, ghost)
+            return max(0, distance - self.capture_distance + self.pacman_speed) // self.pacman_speed
+
+        h = heuristic(pacman)
+        queue = [(h, h, 0, pacman, None)]
+        costs, serial, iterations = {pacman: 0}, 0, 0
+        result = pacman
+        while queue:
+            if iterations & 15 == 0:
+                self._check_time()
+            iterations += 1
+            priority, h, _, cell, first = heapq.heappop(queue)
+            if priority - h != costs[cell]:
+                continue
+            if self._manhattan(cell, ghost) < self.capture_distance:
+                result = first if first is not None else pacman
+                break
+            cost = costs[cell] + 1
+            targets = self._ordered_pacman_targets(cell)
+            stride = len(targets) // len(Move)
+            for direction in (3, 1, 2, 0):  # Right, down, left, up; longer steps first.
+                for step in range(stride - 1, -1, -1):
+                    nxt = targets[direction * stride + step]
+                    if cost < costs.get(nxt, float('inf')):
+                        costs[nxt] = cost
+                        serial += 1
+                        nh = heuristic(nxt)
+                        heapq.heappush(queue, (cost + nh, nh, serial, nxt,
+                                               nxt if first is None else first))
+        self.capture_cache[key] = result
+        if len(self.capture_cache) > CAPTURE_CACHE_SIZE:
+            self.capture_cache.popitem(last=False)
+        return result
+
+    def _find_capture_cycle(self, ghost, pacman):
+        """Return a closed safe policy for the deterministic model, or no proof.
+
+        A path back into the active DFS stack gives a finite prefix and cycle.
+        Its guarantee is conditional on the model continuing to match; hidden
+        observations and mismatches prevent its use.
+        """
+        path, actions, active, failed = [], [], set(), set()
+        now = time.perf_counter()
+        stop = now + max(0, self.deadline - now) * 0.5
+        visits = 0
+
+        def search(state, left):
+            nonlocal visits
+            visits += 1
+            if visits > CAPTURE_CYCLE_NODES or time.perf_counter() >= stop:
+                return None
+            self._check_time()
+            if state in active:
+                return dict(zip(path, actions))
+            if not left or (state, left) in failed:
+                return None
+            g, p = state
+            following = self._capture_prediction(g, p)
+            choices = [(move, pos) for move, pos in self.ghost_actions[g]
+                       if self._manhattan(pos, following) >= self.capture_distance]
+            choices.sort(key=lambda action: (self._manhattan(action[1], following),
+                                              len(self.ghost_actions[action[1]]),
+                                              -self.visits[action[1]]), reverse=True)
+            active.add(state)
+            path.append(state)
+            for move, pos in choices:
+                actions.append(move)
+                plan = search((pos, following), left - 1)
+                if plan is not None:
+                    return plan
+                actions.pop()
+            path.pop()
+            active.remove(state)
+            failed.add((state, left))
+            return None
+
+        return search((ghost, pacman), CAPTURE_CYCLE_DEPTH)
 
     def _ordered_pacman_targets(self, pos):
         # Liệt kê đích theo thứ tự Move và số bước; giữ đích trùng để phá hòa ổn định.
@@ -560,6 +722,17 @@ class GhostAgent(BaseGhostAgent):
                 and response_table['depth'] < remaining):
             return None
         predicted_pacman_indices = response_table['policy'][ghost_index, pacman_index]
+        chance = None
+        capture_turn = response_table['ranks'][ghost_index, pacman_index]
+        if (self.stochastic_survival and model in (MODEL_GREEDY_VERTICAL, MODEL_GREEDY_HORIZONTAL)
+                and 0 < capture_turn <= remaining):
+            values = self._stochastic_values(response_table, remaining - 1)
+            if values is not None:
+                probabilities = response_table['chance']['weights'][ghost_index, pacman_index]
+                chance = {move: float(values[index[pos], predicted_pacman_indices] @ probabilities)
+                          for move, pos in actions}
+                if max(chance.values(), default=0) <= 1e-12:
+                    chance = None
         best_move, best_score = None, None
         for move, pos in actions:
             self._check_time()
@@ -567,11 +740,48 @@ class GhostAgent(BaseGhostAgent):
             lifetime = min(remaining if rank < 0 else min(remaining, int(rank)) for rank in ranks)
             safe = all(self._manhattan(pos, enemy) >= self.capture_distance
                        for enemy in self.pacman_targets[pacman])
-            score = (lifetime, safe, self._evaluate(pos, pacman),
+            score = ((chance[move] if chance is not None else 0), lifetime, safe, self._evaluate(pos, pacman),
                      -self.visits[pos], move != Move.STAY)
             if best_score is None or score > best_score:
                 best_move, best_score = move, score
         return best_move
+
+    def _stochastic_values(self, table, turns):
+        """Finite-horizon survival probability for a learned greedy policy.
+
+        All fallback directions have equal probability. A stable Bellman table
+        is exact for every longer horizon; otherwise only completed horizons
+        are returned. Guaranteed wins remain handled by the robust tables.
+        """
+        size = len(table['index'])
+        policy = table['policy']
+        if size * size * 8 * (33 + policy.shape[2]) > 16 * 1024 * 1024:
+            return None
+        if 'chance' not in table:
+            unique = np.ones(policy.shape, dtype=bool)
+            for k in range(1, policy.shape[2]):
+                unique[:, :, k] = (policy[:, :, k, None] != policy[:, :, :k]).all(axis=2)
+            weights = unique / unique.sum(axis=2, keepdims=True)
+            table['chance'] = dict(weights=weights, values=[self.maximin_strategy['safe'].astype(float)],
+                                   converged=False)
+        chance = table['chance']
+        now = time.perf_counter()
+        stop = now + max(0, self.deadline - now) * 0.65
+        ghosts = self.maximin_strategy['ghost_moves']
+        while (len(chance['values']) <= min(turns, 32) and not chance['converged']
+               and time.perf_counter() < stop):
+            previous = chance['values'][-1]
+            following = np.zeros_like(previous)
+            for action in range(ghosts.shape[1]):
+                expected = (previous[ghosts[:, action, None, None], policy] * chance['weights']).sum(axis=2)
+                np.maximum(following, expected, out=following)
+            following *= self.maximin_strategy['safe']
+            chance['converged'] = np.array_equal(previous, following)
+            chance['values'].append(following)
+        self._check_time()
+        if turns < len(chance['values']):
+            return chance['values'][turns]
+        return chance['values'][-1] if chance['converged'] else None
 
     def _pacman_distance_map(self, start):
         # Trả {ô: số lượt Pacman ít nhất từ start}, có tính tốc độ và tường; dùng cache.
@@ -641,6 +851,10 @@ class GhostAgent(BaseGhostAgent):
             'cache_limit': max(2, min(MODEL_CACHE_SIZE,
                                      (8 * 1024 * 1024) // (len(self.model_prior) * len(nodes) * width * 4))),
             'probabilities': None,
+            'visibility_masks': OrderedDict(),
+            'enemy_memories': None,
+            'enemy_visits': np.zeros(len(nodes)),  # Expected occupancy inferred from observations.
+            'search_policy': None,
             'observer': None,
             'step': None,
         }
@@ -651,6 +865,7 @@ class GhostAgent(BaseGhostAgent):
         belief = self.belief
         if belief is None:
             return
+        self._update_memory_mode(enemy)
         nodes, index = belief['nodes'], belief['index']
         learned = None
         streaks = self.model_streaks
@@ -668,6 +883,14 @@ class GhostAgent(BaseGhostAgent):
                         # Giữ một ít prior để mô hình tạm chưa khớp vẫn có thể phục hồi.
                         learned = self.model_weights * (likelihood + 0.04)
                         learned = 0.95 * learned / learned.sum() + 0.05 * self.model_prior
+        memory_workspace = (len(nodes) * belief['edges'].shape[1]
+                            * self.forecast_beam_width * 16 * 24)
+        if (self.opponent_memory and not self.memory_fallback and self.fog_enabled
+                and memory_workspace <= 32 * 1024 * 1024):
+            self._update_enemy_memories(enemy, step_number, learned, streaks)
+            return
+        belief['enemy_memories'] = None
+        if enemy is not None:
             probabilities = np.zeros(len(nodes))
             probabilities[index[enemy]] = 1
         else:
@@ -707,6 +930,157 @@ class GhostAgent(BaseGhostAgent):
         belief['probabilities'] = probabilities
         belief['observer'] = self.current_position
         belief['step'] = step_number
+        if enemy is not None:
+            self.last_sighting = (enemy, self.current_position, step_number)
+
+    def _update_memory_mode(self, enemy):
+        # A fresh sighting provides evidence to resume target-memory tracking.
+        # Movement alone does not clear the latch and repeatedly restart a wait.
+        if enemy is not None:
+            self.memory_stall_steps = 0
+            self.memory_fallback = False
+        else:
+            self.memory_stall_steps = (self.memory_stall_steps + 1
+                                       if self.current_position == self.memory_observer else 1)
+            if (self.memory_stall_limit and self.memory_stall_steps >= self.memory_stall_limit
+                    and len(self.ghost_actions[self.current_position]) <= 3):
+                self.memory_fallback = True
+        self.memory_observer = self.current_position
+
+    @staticmethod
+    def _compact_enemy_memories(memories, limit=8):
+        if len(memories) <= limit:
+            return memories
+        ranked = sorted((key for key in memories if key not in ('full', None)),
+                        key=lambda key: memories[key].sum(), reverse=True)
+        keep = set(ranked[:limit - 2]) | {'full', None}
+        result = {key: values for key, values in memories.items() if key in keep}
+        for key, values in memories.items():
+            if key not in keep:
+                result[None] = result.get(None, 0) + values
+        return result
+
+    def _search_policy(self):
+        belief = self.belief
+        if belief['search_policy'] is not None:
+            return belief['search_policy']
+        edges = belief['edges']
+        size, width = edges.shape
+        rows = np.arange(size)
+        stride = belief['ordered'].shape[1] // len(Move)
+        endpoints = belief['ordered'].reshape(size, len(Move), stride)[:, :4, -1]
+        moving = endpoints != rows[:, None]
+        preference = np.exp(-self.search_exploration * np.minimum(20, belief['enemy_visits'][endpoints])) * moving
+        total = preference.sum(axis=1, keepdims=True)
+        preference = np.divide(preference, total, out=np.zeros_like(preference), where=total > 0)
+        policy = np.zeros_like(edges, dtype=float)
+        for direction in range(4):
+            slots = (edges == endpoints[:, direction, None]).argmax(axis=1)
+            policy[rows, slots] += preference[:, direction]
+        stuck = total[:, 0] == 0
+        slots = (edges == rows[:, None]).argmax(axis=1)
+        policy[rows[stuck], slots[stuck]] = 1
+        uniform = (np.arange(width)[None, :] < belief['counts'][:, None]) / belief['counts'][:, None]
+        belief['search_policy'] = 0.5 * policy + 0.5 * uniform
+        return belief['search_policy']
+
+    def _predict_enemy_memories(self, memories, ghost):
+        """Two vision hypotheses: full vision, or remembered targets under fog.
+
+        Target keys represent what the opponent may remember, not its true state.
+        None is searching; a small bounded mixture retains alternative sightings.
+        """
+        return self._predict_enemy_memories_batch([memories], [ghost])[0]
+
+    def _predict_enemy_memories_batch(self, memories_batch, ghosts):
+        self._check_time()
+        belief = self.belief
+        size = len(belief['nodes'])
+        labels, probabilities, policies = [], [], []
+        policy_cache = {}
+
+        def policy(target):
+            if target not in policy_cache:
+                policy_cache[target] = self._pursuit_policy(target)
+            return policy_cache[target]
+
+        def add(parent, label, distribution, kernel):
+            if distribution.sum() > 1e-15:
+                labels.append((parent, label))
+                probabilities.append(distribution)
+                policies.append(kernel)
+
+        for parent, (memories, ghost) in enumerate(zip(memories_batch, ghosts)):
+            visible = np.zeros(size, dtype=bool)
+            visible[[belief['index'][pos] for pos in self._visible_from(ghost)]] = True
+            observed = np.zeros(size)
+            for target, distribution in memories.items():
+                if target == 'full':
+                    add(parent, target, distribution, policy(ghost))
+                    continue
+                observed += distribution * visible
+                hidden = distribution * ~visible
+                if target is None:
+                    add(parent, None, hidden, self._search_policy())
+                else:
+                    reached = belief['capture'][belief['index'][target]]
+                    add(parent, None, hidden * reached, self._search_policy())
+                    add(parent, target, hidden * ~reached, policy(target))
+            add(parent, ghost, observed, policy(ghost))
+        if not labels:
+            return [{} for _ in ghosts]
+        endpoints = belief['edges'].ravel()[None, :] + size * np.arange(len(labels))[:, None]
+        prediction = np.bincount(endpoints.ravel(),
+                                 weights=(np.asarray(probabilities)[:, :, None] * np.asarray(policies)).ravel(),
+                                 minlength=len(labels) * size).reshape(len(labels), size)
+        result = [{} for _ in ghosts]
+        for (parent, label), distribution in zip(labels, prediction):
+            result[parent][label] = result[parent].get(label, 0) + distribution
+        return [self._compact_enemy_memories(memories) for memories in result]
+
+    def _update_enemy_memories(self, enemy, step_number, learned, streaks):
+        belief = self.belief
+        size = len(belief['nodes'])
+        memories = belief['enemy_memories']
+        if memories is None:
+            prior = (belief['probabilities'] if belief['probabilities'] is not None
+                     else np.full(size, 1 / size))
+            memories = {'full': self.memory_full_prior * prior,
+                        None: (1 - self.memory_full_prior) * prior}
+        if belief['step'] is not None:
+            for _ in range(min(size, max(0, step_number - belief['step']))):
+                memories = self._predict_enemy_memories(memories, belief['observer'])
+        if enemy is not None:
+            mask = np.zeros(size, dtype=bool)
+            mask[belief['index'][enemy]] = True
+        else:
+            mask = np.asarray([pos in self.possible_enemies for pos in belief['nodes']])
+            mask &= ~belief['capture'][belief['index'][self.current_position]]
+        memories = {key: values * mask for key, values in memories.items()}
+        mass = sum(values.sum() for values in memories.values())
+        if mass <= 1e-12:
+            memories = {'full': self.memory_full_prior * mask.astype(float),
+                        None: (1 - self.memory_full_prior) * mask.astype(float)}
+            mass = sum(values.sum() for values in memories.values())
+        if mass <= 0:
+            return
+        memories = {key: values / mass for key, values in memories.items()}
+        for key, weight in (('full', self.memory_full_prior), (None, 1 - self.memory_full_prior)):
+            memories[key] = memories.get(key, 0) + 1e-6 * weight * mask
+        marginal = sum(memories.values())
+        mass = marginal.sum()
+        memories = {key: values / mass for key, values in memories.items()}
+        self._check_time()
+        if learned is not None:
+            self.model_weights = learned
+            self.model_streaks = streaks
+            self.model_observations += 1
+            belief['policies'].clear()
+        belief['enemy_memories'] = memories
+        belief['probabilities'] = marginal / mass
+        belief['enemy_visits'] += belief['probabilities']
+        belief['search_policy'] = None
+        belief['observer'], belief['step'] = self.current_position, step_number
         if enemy is not None:
             self.last_sighting = (enemy, self.current_position, step_number)
 
@@ -883,59 +1257,144 @@ class GhostAgent(BaseGhostAgent):
         # allowed giới hạn nước đầu tiên; best_move là dự phòng nếu hết giờ.
         belief = self.belief
         horizon = min(self.forecast_horizon, self.max_depth, remaining)
-        states = [(self.current_position, belief['probabilities'], None)]
+        memory = self.opponent_memory and self.fog_enabled and belief['enemy_memories'] is not None
+        distribution = belief['enemy_memories'] if memory else belief['probabilities']
+        states = [(self.current_position, distribution, None)]
         try:
             for depth in range(1, horizon + 1):
-                candidates = []
-                for ghost, probabilities, first in states:
-                    prediction = self._forecast(probabilities, ghost)
-                    for move, pos in self.ghost_actions[ghost]:
-                        if depth == 1 and allowed is not None and move not in allowed:
-                            continue
-                        self._check_time()
-                        following = prediction.copy()
-                        following[belief['capture'][belief['index'][pos]]] = 0
-                        # Không chuẩn hóa lại sau khi bỏ các trường hợp bị bắt.
-                        # mass là xác suất sống sót suốt chuỗi nước đi đang xét.
-                        mass = following.sum()
-                        distances, turns, corner = self._turn_geometry(pos)
-                        space = float(following @ distances)
-                        information = self._information_gain(pos, following)
-                        turn_delay = float(following @ turns)
-                        utility = (10000 * mass + 0.4 * space
-                                   + 0.25 * mass * information + 0.3 * turn_delay
-                                   + 0.2 * mass * (corner + 0.5 * (len(self.ghost_actions[pos]) > 3))
-                                   + mass * (len(self.ghost_actions[pos]) - 1
-                                             - 4 * (pos in self.trapped)
-                                             - 0.1 * self.visits[pos]))
-                        candidates.append((utility, first if first is not None else move,
-                                           pos, following))
+                expand = self._memory_candidates if memory else self._forecast_candidates
+                candidates = expand(states, allowed if depth == 1 else None)
                 candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-                unique, seen = [], set()
-                for candidate in candidates:
-                    key = (candidate[1], candidate[2])
-                    if key not in seen:
-                        unique.append(candidate)
-                        seen.add(key)
-                if not unique:
+                selected = self._select_forecast_states(candidates)
+                if not selected:
                     break
-                best_move = unique[0][1]
-                # Reserve a branch for each first action; one action must not crowd
-                # every alternative out before its escape route comes into view.
-                leaders = {}
-                for candidate in unique:
-                    leaders.setdefault(candidate[1], candidate)
-                selected = list(leaders.values())
-                for candidate in unique:
-                    if len(selected) >= self.forecast_beam_width:
-                        break
-                    if candidate is not leaders[candidate[1]]:
-                        selected.append(candidate)
+                best_move = selected[0][1]
                 states = [(pos, probabilities, first)
                           for _, first, pos, probabilities in selected]
         except SearchTimeout:
             pass
         return best_move
+
+    def _forecast_batch(self, distributions, ghosts):
+        """Propagate a beam with one scatter rather than one scatter per path."""
+        self._check_time()
+        belief = self.belief
+        probabilities = np.asarray(distributions)
+        kernels = np.asarray([self._pursuit_policy(ghost) for ghost in ghosts])
+        base = belief['edges'].ravel()
+        cells_per_path = int(np.prod(probabilities.shape[1:]))
+        endpoints = base[None, :] + cells_per_path * np.arange(len(ghosts))[:, None]
+        prediction = np.bincount(endpoints.ravel(),
+                                 weights=(probabilities[..., None] * kernels).ravel(),
+                                 minlength=probabilities.size).reshape(probabilities.shape)
+        return prediction
+
+    def _forecast_candidates(self, states, allowed=None):
+        predictions = self._forecast_batch([state[1] for state in states],
+                                            [state[0] for state in states])
+        paths = [(parent, first if first is not None else move, pos)
+                 for parent, (ghost, _, first) in enumerate(states)
+                 for move, pos in self.ghost_actions[ghost]
+                 if allowed is None or move in allowed]
+        if not paths:
+            return []
+        self._check_time()
+        positions = [path[2] for path in paths]
+        capture = self.belief['capture'][[self.belief['index'][pos] for pos in positions]]
+        following = predictions[[path[0] for path in paths]]
+        following *= ~capture
+        marginals = following
+        utilities = self._forecast_utilities(positions, marginals)
+        return [(float(utility), path[1], path[2], distribution)
+                for utility, path, distribution in zip(utilities, paths, following)]
+
+    def _memory_candidates(self, states, allowed=None):
+        paths, distributions, marginals = [], [], []
+        predictions = self._predict_enemy_memories_batch([state[1] for state in states],
+                                                        [state[0] for state in states])
+        for parent, (ghost, memories, first) in enumerate(states):
+            predicted = predictions[parent]
+            for move, pos in self.ghost_actions[ghost]:
+                if allowed is not None and move not in allowed:
+                    continue
+                self._check_time()
+                safe = ~self.belief['capture'][self.belief['index'][pos]]
+                following = {key: values * safe for key, values in predicted.items()}
+                paths.append((parent, first if first is not None else move, pos))
+                distributions.append(following)
+                marginals.append(sum(following.values()) if following else
+                                 np.zeros(len(self.belief['nodes'])))
+        if not paths:
+            return []
+        utilities = self._forecast_utilities([path[2] for path in paths], np.asarray(marginals))
+        return [(float(utility), path[1], path[2], distribution)
+                for utility, path, distribution in zip(utilities, paths, distributions)]
+
+    def _forecast_utilities(self, positions, marginals):
+        mass = marginals.sum(axis=1)
+        geometry = {pos: self._turn_geometry(pos) for pos in dict.fromkeys(positions)}
+        distances = np.asarray([geometry[pos][0] for pos in positions])
+        turns = np.asarray([geometry[pos][1] for pos in positions])
+        space = np.einsum('ij,ij->i', marginals, distances)
+        delay = np.einsum('ij,ij->i', marginals, turns)
+        information = self._information_gains(positions, marginals, mass)
+        bias = np.asarray([0.2 * (geometry[pos][2] + 0.5 * (len(self.ghost_actions[pos]) > 3))
+                           + len(self.ghost_actions[pos]) - 1 - 4 * (pos in self.trapped)
+                           - 0.1 * self.visits[pos] for pos in positions])
+        utilities = 10000 * mass + 0.4 * space + 0.3 * delay + mass * (bias + 0.25 * information)
+        self._check_time()
+        return utilities
+
+    def _information_gains(self, positions, probabilities, mass):
+        if not self.fog_enabled:
+            return np.zeros(len(positions))
+        belief = self.belief
+        masks = belief['visibility_masks']
+        rows = {}
+        for pos in dict.fromkeys(positions):
+            key = (pos, self.vision_radius)
+            if key not in masks:
+                visible = np.zeros(len(belief['nodes']), dtype=bool)
+                visible[[belief['index'][cell] for cell in self._visible_from(pos)]] = True
+                masks[key] = visible
+                if len(masks) > DISTANCE_CACHE_SIZE:
+                    masks.popitem(last=False)
+            else:
+                masks.move_to_end(key)
+            rows[pos] = masks[key]
+        visible = probabilities * np.asarray([rows[pos] for pos in positions])
+        visible = np.divide(visible, mass[:, None], out=np.zeros_like(visible), where=mass[:, None] > 0)
+        outside = np.maximum(0, 1 - visible.sum(axis=1))
+        logarithms = np.log2(visible, out=np.zeros_like(visible), where=visible > 0)
+        outside_log = np.log2(outside, out=np.zeros_like(outside), where=outside > 0)
+        return -np.einsum('ij,ij->i', visible, logarithms) - outside * outside_log
+
+    def _select_forecast_states(self, candidates):
+        # Position alone is not a belief state: different paths can leave
+        # different enemy distributions and different surviving probability mass.
+        unique, seen = [], set()
+        for candidate in candidates:
+            distribution = candidate[3]
+            key = (candidate[1], candidate[2])
+            if self.belief_merge == 'exact':
+                if isinstance(distribution, dict):
+                    key += (tuple(sorted((repr(label), values.tobytes())
+                                          for label, values in distribution.items())),)
+                else:
+                    key += (distribution.shape, distribution.tobytes())
+            if key not in seen:
+                unique.append(candidate)
+                seen.add(key)
+        leaders = {}
+        for candidate in unique:
+            leaders.setdefault(candidate[1], candidate)
+        selected = list(leaders.values())
+        for candidate in unique:
+            if len(selected) >= self.forecast_beam_width:
+                break
+            if candidate is not leaders[candidate[1]]:
+                selected.append(candidate)
+        return selected
 
     def _distance_map(self, start):
         # Trả {ô: số bước ngắn nhất từ start} và lưu cache; bỏ các ô không tới được.
